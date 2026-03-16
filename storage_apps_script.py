@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -206,3 +207,34 @@ class AppsScriptStorage:
         if include_other and "其他" not in values:
             values.append("其他")
         return values
+
+    def upload_drive_file(
+        self,
+        actor: Actor,
+        *,
+        filename: str,
+        file_bytes: bytes,
+        mime_type: str = '',
+        category: str = 'attachment',
+        record_id: str = '',
+        owner_email: str = '',
+    ) -> Dict[str, Any]:
+        payload = {
+            "filename": filename or 'file.bin',
+            "content_base64": base64.b64encode(file_bytes or b'').decode('ascii'),
+            "mime_type": mime_type or 'application/octet-stream',
+            "category": category or 'attachment',
+            "record_id": record_id or '',
+            "owner_email": (owner_email or actor.email or '').strip().lower(),
+        }
+        return self._post("upload_drive_file", actor=actor, payload=payload).get("data", {})
+
+    def delete_drive_file(self, actor: Actor, drive_file_id: str) -> Dict[str, Any]:
+        return self._post("delete_drive_file", actor=actor, payload={"drive_file_id": drive_file_id}).get("data", {})
+
+    def download_drive_file(self, actor: Actor, drive_file_id: str) -> Dict[str, Any]:
+        data = self._post("get_drive_file_content", actor=actor, payload={"drive_file_id": drive_file_id}).get("data", {})
+        content_base64 = str(data.get("content_base64") or "")
+        data["file_bytes"] = base64.b64decode(content_base64) if content_base64 else b""
+        return data
+

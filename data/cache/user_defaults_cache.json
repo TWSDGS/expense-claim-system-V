@@ -69,22 +69,5 @@
     "is_active": true,
     "note": "管理員預設值",
     "_row_number": 3
-  },
-  {
-    "email": "Steve.Lin@sahtech.org",
-    "default_employee_name": "林以辰",
-    "default_employee_no": 10503,
-    "default_department": "化安處",
-    "default_plan_code": "",
-    "default_handler_name": "employee",
-    "default_project_manager_name": "",
-    "default_department_manager_name": "",
-    "default_accountant_name": "",
-    "default_note_public": "",
-    "default_trip_time_start": "1899-12-30T01:00:00.000Z",
-    "default_trip_time_end": "1899-12-30T09:00:00.000Z",
-    "is_active": true,
-    "note": "一般使用者預設值",
-    "_row_number": 12
   }
 ]

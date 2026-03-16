@@ -1,245 +1,273 @@
-
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
-from cache_utils import (
-    append_sync_audit,
-    load_master_snapshot,
-    save_master_snapshot,
-    load_pending_sync_queue,
-    save_pending_sync_queue,
-)
+
+def _safe_import_cache_utils():
+    import cache_utils as cu  # type: ignore
+    return cu
 
 
-def _to_dt(v: Any) -> datetime:
-    s = str(v or '').strip()
-    if not s:
-        return datetime.min
-    try:
-        return datetime.fromisoformat(s.replace('Z', '+00:00'))
-    except Exception:
-        return datetime.min
+def _normalize_df(data: Any) -> pd.DataFrame:
+    if isinstance(data, pd.DataFrame):
+        df = data.copy()
+    elif isinstance(data, list):
+        df = pd.DataFrame(data)
+    elif isinstance(data, tuple) and len(data) == 2 and isinstance(data[0], list):
+        df = pd.DataFrame(data[0])
+    else:
+        df = pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
+    df = df.fillna("")
+    if "record_id" not in df.columns:
+        df["record_id"] = ""
+    if "status" not in df.columns:
+        df["status"] = "draft"
+    if "version" not in df.columns:
+        df["version"] = 1
+    if "updated_at" not in df.columns:
+        df["updated_at"] = ""
+    return df
 
 
-def _normalize_rows(rows: Any) -> List[Dict[str, Any]]:
-    if isinstance(rows, pd.DataFrame):
-        rows = rows.fillna('').to_dict(orient='records')
-    if not isinstance(rows, list):
-        return []
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        if isinstance(row, dict):
-            out.append(dict(row))
+def _record_id_of(row: Dict[str, Any]) -> str:
+    return str((row or {}).get("record_id") or (row or {}).get("id") or "").strip()
+
+
+def _pending_matches_entity(item: Dict[str, Any], entity_type: str) -> bool:
+    payload = dict((item or {}).get("payload") or {})
+    op = str((item or {}).get("operation") or "").lower()
+    system_type = str(payload.get("system_type") or "").lower()
+    if system_type:
+        return system_type == entity_type.lower()
+    if entity_type.lower() == "travel":
+        return op.startswith("travel") or "travel" in op
+    return op.startswith("expense") or "expense" in op or not ("travel" in op)
+
+
+def _status_after_soft_delete(existing_status: str) -> str:
+    return "void" if str(existing_status).lower() == "submitted" else "deleted"
+
+
+def _overlay_pending(base_df: pd.DataFrame, pending_items: List[Dict[str, Any]]) -> pd.DataFrame:
+    df = _normalize_df(base_df)
+    by_id: Dict[str, Dict[str, Any]] = {}
+    if not df.empty:
+        for row in df.to_dict(orient="records"):
+            rid = _record_id_of(row)
+            if rid:
+                by_id[rid] = dict(row)
+
+    for item in pending_items:
+        payload = dict((item or {}).get("payload") or {})
+        rid = _record_id_of(payload)
+        if not rid:
+            continue
+        op = str((item or {}).get("operation") or "").lower()
+        if op.endswith("hard_delete"):
+            by_id.pop(rid, None)
+            continue
+
+        existing = dict(by_id.get(rid, {}))
+        existing.update(payload)
+        if op.endswith("soft_delete"):
+            existing["status"] = _status_after_soft_delete(existing.get("status", payload.get("status", "draft")))
+        existing["needs_sync"] = True
+        existing["sync_status"] = item.get("sync_status") or "pending"
+        by_id[rid] = existing
+
+    rows = list(by_id.values())
+    out = _normalize_df(rows)
+    if not out.empty and "record_id" in out.columns:
+        out = out.drop_duplicates(subset=["record_id"], keep="last")
     return out
 
 
-def _infer_system(item: Dict[str, Any]) -> str:
-    payload = dict((item or {}).get('payload') or {})
-    system_type = str(payload.get('system_type') or '').strip().lower()
-    if system_type:
-        return system_type
-    op = str((item or {}).get('operation') or '').strip().lower()
-    return 'travel' if 'travel' in op else 'expense'
-
-
-def _normalize_operation(operation: str) -> str:
-    op = str(operation or '').strip().lower()
-    if 'hard' in op and 'delete' in op:
-        return 'hard_delete'
-    if 'soft' in op and 'delete' in op:
-        return 'soft_delete'
-    if 'restore' in op:
-        return 'restore'
-    if 'submit' in op:
-        return 'submit'
-    if 'draft' in op or 'save' in op:
-        return 'save_draft'
-    if 'delete' in op:
-        return 'soft_delete'
-    return op or 'save_draft'
-
-
-def _choose_newer(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
-    old_v = int(old.get('version') or 0) if str(old.get('version') or '').strip().isdigit() else 0
-    new_v = int(new.get('version') or 0) if str(new.get('version') or '').strip().isdigit() else 0
-    if new_v != old_v:
-        return dict(new if new_v > old_v else old)
-    return dict(new if _to_dt(new.get('updated_at')) >= _to_dt(old.get('updated_at')) else old)
-
-
-def merge_rows(base_rows: List[Dict[str, Any]], overlay_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    mapping: Dict[str, Dict[str, Any]] = {}
-    extras: List[Dict[str, Any]] = []
-    for row in _normalize_rows(base_rows):
-        rid = str(row.get('record_id') or '').strip()
-        if rid:
-            mapping[rid] = dict(row)
-        else:
-            extras.append(dict(row))
-    for row in _normalize_rows(overlay_rows):
-        rid = str(row.get('record_id') or '').strip()
-        if not rid:
-            extras.append(dict(row))
-            continue
-        if rid in mapping:
-            mapping[rid] = _choose_newer(mapping[rid], row)
-        else:
-            mapping[rid] = dict(row)
-    rows = list(mapping.values()) + extras
-    rows.sort(key=lambda r: str(r.get('updated_at') or r.get('created_at') or ''), reverse=True)
-    return rows
-
-
-def overlay_pending_rows(base_rows: List[Dict[str, Any]], pending_items: List[Dict[str, Any]], system_type: str) -> List[Dict[str, Any]]:
-    mapping: Dict[str, Dict[str, Any]] = {}
-    extras: List[Dict[str, Any]] = []
-    for row in _normalize_rows(base_rows):
-        rid = str(row.get('record_id') or '').strip()
-        if rid:
-            mapping[rid] = dict(row)
-        else:
-            extras.append(dict(row))
-    items = [item for item in _normalize_rows(pending_items) if _infer_system(item) == system_type]
-    items.sort(key=lambda item: str(item.get('queued_at') or ''))
-    for item in items:
-        payload = dict(item.get('payload') or {})
-        rid = str(payload.get('record_id') or '').strip()
-        op = _normalize_operation(item.get('operation') or '')
-        existing = dict(mapping.get(rid, {})) if rid else {}
-        if op == 'hard_delete':
-            if rid in mapping:
-                mapping.pop(rid, None)
-            continue
-        row = dict(existing)
-        row.update(payload)
-        row['system_type'] = system_type
-        row['needs_sync'] = True
-        row['sync_status'] = str(payload.get('sync_status') or 'pending')
-        row['sync_message'] = str(payload.get('sync_message') or item.get('last_error') or '')
-        if op == 'save_draft':
-            row['status'] = str(payload.get('status') or 'draft')
-        elif op == 'submit':
-            row['status'] = 'submitted'
-        elif op == 'restore':
-            row['status'] = str(payload.get('status') or row.get('status') or 'draft')
-        elif op == 'soft_delete':
-            target = str(payload.get('status') or '').strip().lower()
-            if not target:
-                target = 'void' if str(existing.get('status') or '').strip().lower() in {'submitted', 'void'} else 'deleted'
-            row['status'] = target
-        if rid:
-            mapping[rid] = row
-        else:
-            extras.append(row)
-    rows = list(mapping.values()) + extras
-    rows.sort(key=lambda r: str(r.get('updated_at') or r.get('created_at') or ''), reverse=True)
-    return rows
-
-
 def build_master_dataframe(
-    system_type: str,
-    actor_email: str,
-    fetch_cloud_rows: Callable[[], Any],
-    local_rows: Optional[List[Dict[str, Any]]] = None,
+    entity_type: str,
+    actor_or_owner: Any,
+    api_or_fetcher: Any = None,
+    *,
+    fetch_cloud_rows: Optional[Callable[[], Iterable[Dict[str, Any]]]] = None,
+    local_rows: Optional[Iterable[Dict[str, Any]]] = None,
+    force_refresh: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    system_type = str(system_type or '').strip().lower()
-    actor_email = str(actor_email or '').strip().lower()
-    cloud_source = 'cloud'
-    cloud_rows: List[Dict[str, Any]] = []
-    cloud_ok = False
+    """
+    Compatible with both calling styles used across patched files:
+
+    1) build_master_dataframe("expense", actor, api, force_refresh=False)
+    2) build_master_dataframe("expense", actor.email, fetch_cloud_rows=..., local_rows=...)
+    3) build_master_dataframe("expense", actor.email, some_fetch_function, local_rows=...)
+    """
+    cu = _safe_import_cache_utils()
+
+    if isinstance(actor_or_owner, str):
+        owner_email = actor_or_owner.strip().lower()
+        actor = None
+        actor_role = "user"
+    else:
+        actor = actor_or_owner
+        owner_email = str(getattr(actor_or_owner, "email", "") or "").strip().lower()
+        actor_role = str(getattr(actor_or_owner, "role", "user") or "user")
+
+    if fetch_cloud_rows is None and callable(api_or_fetcher) and not hasattr(api_or_fetcher, "records_df"):
+        fetch_cloud_rows = api_or_fetcher
+        api = None
+    else:
+        api = api_or_fetcher
+
+    cache_key = owner_email or "global"
+
+    snap_df = pd.DataFrame()
+    if not force_refresh:
+        try:
+            snap_df = _normalize_df(cu.load_master_snapshot(entity_type, cache_key))
+        except Exception:
+            snap_df = pd.DataFrame()
+
+    cloud_df = pd.DataFrame()
+    source = "empty"
+    cloud_online = False
     try:
-        cloud_rows = _normalize_rows(fetch_cloud_rows())
-        save_master_snapshot(system_type, actor_email, cloud_rows)
-        cloud_ok = True
-    except Exception as exc:
-        cloud_rows = load_master_snapshot(system_type, actor_email)
-        cloud_source = 'snapshot' if cloud_rows else 'empty'
-        append_sync_audit({
-            'event_type': 'cloud_fetch_failed',
-            'system_type': system_type,
-            'queue_owner_email': actor_email,
-            'message': str(exc),
-        })
-    merged_rows = merge_rows(cloud_rows, _normalize_rows(local_rows or [])) if local_rows else list(cloud_rows)
-    pending_items = load_pending_sync_queue(actor_email)
-    master_rows = overlay_pending_rows(merged_rows, pending_items, system_type)
-    df = pd.DataFrame(master_rows).fillna('') if master_rows else pd.DataFrame()
-    if not df.empty and 'record_id' in df.columns:
-        df = df.drop_duplicates(subset=['record_id'], keep='last')
-    if not df.empty and 'owner_name' not in df.columns:
-        if system_type == 'travel':
-            df['owner_name'] = df.get('traveler', '')
+        if callable(fetch_cloud_rows):
+            cloud_df = _normalize_df(list(fetch_cloud_rows() or []))
+        elif api is not None and hasattr(api, "records_df"):
+            cloud_df = _normalize_df(api.records_df(actor=actor, status=None, owner_only=False))
         else:
-            df['owner_name'] = df.get('employee_name', '')
+            cloud_df = pd.DataFrame()
+        source = "cloud"
+        cloud_online = True
+        try:
+            cu.save_master_snapshot(entity_type, cache_key, cloud_df.to_dict(orient="records"))
+        except Exception:
+            pass
+    except Exception:
+        cloud_df = snap_df
+        source = "snapshot" if not snap_df.empty else "empty"
+        cloud_online = False
+
+    local_df = _normalize_df(list(local_rows or [])) if local_rows is not None else pd.DataFrame()
+
+    try:
+        pending_all = list(cu.load_pending_sync())
+    except Exception:
+        pending_all = []
+
+    pending_items: List[Dict[str, Any]] = []
+    for item in pending_all:
+        if not _pending_matches_entity(item, entity_type):
+            continue
+        payload = dict((item or {}).get("payload") or {})
+        payload_owner = str(payload.get("user_email") or owner_email).strip().lower()
+        if actor_role != "admin" and owner_email and payload_owner and payload_owner != owner_email:
+            continue
+        pending_items.append(item)
+
+    base_df = cloud_df if not cloud_df.empty else local_df
+    if not local_df.empty:
+        local_by_id = {}
+        if not base_df.empty:
+            for row in base_df.to_dict(orient="records"):
+                rid = _record_id_of(row)
+                if rid:
+                    local_by_id[rid] = dict(row)
+        for row in local_df.to_dict(orient="records"):
+            rid = _record_id_of(row)
+            if rid:
+                local_by_id[rid] = dict(row)
+        base_df = _normalize_df(list(local_by_id.values()))
+
+    master_df = _overlay_pending(base_df, pending_items)
     report = {
-        'system_type': system_type,
-        'cloud_source': cloud_source,
-        'cloud_online': cloud_ok,
-        'cloud_count': len(cloud_rows),
-        'local_count': len(_normalize_rows(local_rows or [])),
-        'pending_count': len([x for x in pending_items if _infer_system(x) == system_type]),
-        'master_count': int(len(df.index)) if isinstance(df, pd.DataFrame) else 0,
-        'last_checked_at': datetime.now().isoformat(timespec='seconds'),
+        "entity_type": entity_type,
+        "source": source,
+        "master_count": int(len(master_df.index)) if isinstance(master_df, pd.DataFrame) else 0,
+        "cloud_count": int(len(cloud_df.index)) if isinstance(cloud_df, pd.DataFrame) else 0,
+        "local_count": int(len(local_df.index)) if isinstance(local_df, pd.DataFrame) else 0,
+        "pending_count": len(pending_items),
+        "cloud_online": cloud_online,
     }
-    return df, report
+    return master_df, report
 
 
-def sync_pending_events(system_type: str, actor: Any, api: Any) -> Dict[str, Any]:
-    owner_email = str(getattr(actor, 'email', '') or '').strip().lower()
-    queue = load_pending_sync_queue(owner_email)
-    if not queue:
-        return {'synced': 0, 'failed': 0, 'remaining': 0}
-    new_queue: List[Dict[str, Any]] = []
+def sync_pending_events(entity_type: str, actor: Any, api: Any) -> Dict[str, Any]:
+    cu = _safe_import_cache_utils()
+    owner_email = str(getattr(actor, "email", "") or "").strip().lower()
+    role = str(getattr(actor, "role", "user") or "user")
+
+    try:
+        pending_all = list(cu.load_pending_sync())
+    except Exception:
+        pending_all = []
+
+    relevant: List[Dict[str, Any]] = []
+    for item in pending_all:
+        if not _pending_matches_entity(item, entity_type):
+            continue
+        payload = dict((item or {}).get("payload") or {})
+        payload_owner = str(payload.get("user_email") or owner_email).strip().lower()
+        if role != "admin" and owner_email and payload_owner and payload_owner != owner_email:
+            continue
+        relevant.append(item)
+
     synced = 0
     failed = 0
-    for item in queue:
-        if _infer_system(item) != system_type:
-            new_queue.append(item)
-            continue
-        payload = dict(item.get('payload') or {})
-        rid = str(payload.get('record_id') or '').strip()
-        op = _normalize_operation(item.get('operation') or '')
+    conflicts = 0
+    conflict_records: List[Dict[str, Any]] = []
+
+    for item in relevant:
+        op = str(item.get("operation") or "")
+        payload = dict(item.get("payload") or {})
+        event_id = item.get("event_id") or payload.get("event_id")
+        lower_op = op.lower()
         try:
-            if op == 'hard_delete':
-                api.record_hard_delete(actor=actor, record_id=rid)
-            elif op == 'soft_delete':
-                api.record_soft_delete(actor=actor, record_id=rid)
-            elif op == 'restore' and hasattr(api, 'record_restore'):
-                api.record_restore(actor=actor, payload=payload)
-            elif op == 'submit' or (op == 'restore' and str(payload.get('status') or '').strip().lower() == 'submitted'):
+            if lower_op.endswith("hard_delete"):
+                api.record_hard_delete(actor=actor, record_id=payload.get("record_id"), payload=payload)
+            elif lower_op.endswith("soft_delete"):
+                if hasattr(api, "record_soft_delete"):
+                    api.record_soft_delete(actor=actor, record_id=payload.get("record_id"), payload=payload)
+                else:
+                    payload.setdefault("status", "deleted")
+                    api.record_save_draft(actor=actor, payload=payload)
+            elif lower_op.endswith("submit") or lower_op in {"expense_submit", "travel_submit"}:
                 api.record_submit(actor=actor, payload=payload)
+            elif lower_op.endswith("restore") and hasattr(api, "record_restore"):
+                api.record_restore(actor=actor, payload=payload)
             else:
                 api.record_save_draft(actor=actor, payload=payload)
+
+            try:
+                cu.mark_sync_success(event_id)
+                cu.remove_pending_sync_item(event_id)
+            except Exception:
+                pass
             synced += 1
-            append_sync_audit({
-                'event_type': 'sync_applied',
-                'operation': op,
-                'record_id': rid,
-                'system_type': system_type,
-                'queue_owner_email': owner_email,
-                'event_id': item.get('event_id', ''),
-            })
-        except Exception as exc:
-            failed += 1
-            payload['needs_sync'] = True
-            payload['sync_status'] = 'failed'
-            payload['sync_message'] = str(exc)
-            item['payload'] = payload
-            item['retry_count'] = int(item.get('retry_count') or 0) + 1
-            item['last_error'] = str(exc)
-            new_queue.append(item)
-            append_sync_audit({
-                'event_type': 'sync_apply_failed',
-                'operation': op,
-                'record_id': rid,
-                'system_type': system_type,
-                'queue_owner_email': owner_email,
-                'event_id': item.get('event_id', ''),
-                'message': str(exc),
-            })
-    save_pending_sync_queue(new_queue, owner_email)
-    return {'synced': synced, 'failed': failed, 'remaining': len([x for x in new_queue if _infer_system(x) == system_type])}
+        except Exception as e:
+            msg = str(e)
+            if "VERSION_CONFLICT" in msg:
+                conflicts += 1
+                conflict_records.append({
+                    "event_id": event_id,
+                    "record_id": payload.get("record_id"),
+                    "message": msg,
+                })
+                try:
+                    cu.mark_sync_failed(event_id, msg)
+                    cu.update_pending_sync_item(event_id, {"sync_status": "conflict", "sync_message": msg})
+                except Exception:
+                    pass
+            else:
+                failed += 1
+                try:
+                    cu.mark_sync_failed(event_id, msg)
+                except Exception:
+                    pass
+
+    return {
+        "synced": synced,
+        "failed": failed,
+        "conflicts": conflicts,
+        "conflict_records": conflict_records,
+    }

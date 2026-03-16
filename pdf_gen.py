@@ -1,115 +1,120 @@
-import io, os, json, re
-from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Tuple
 
-from PIL import Image
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.pdfgen import canvas
+import io
+import os
+import re
+import json
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Tuple, Optional
 
 try:
     from pypdf import PdfReader, PdfWriter
 except Exception:
-    PdfReader = PdfWriter = None
+    PdfReader = None
+    PdfWriter = None
 
-PAGE_W, PAGE_H = A4
-BG_PATH = os.path.join('/mnt/data', 'voucher_bg.png')
+from PIL import Image
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+# Background image native size (pixels)
 BG_W_PX = 1448
 BG_H_PX = 2048
+
+# A4 size in points
+PAGE_W, PAGE_H = A4
 SCALE = PAGE_W / BG_W_PX
-DIGIT_CENTER_X = [614.5, 707.0, 799.5, 892.0, 984.0, 1076.5, 1169.0, 1261.0]
+DEFAULT_BG_NAME = 'voucher_bg.png'
+
+# Digit boxes boundaries detected from the provided image (pixels)
+DIGIT_BOX_XS = [568, 661, 753, 846, 938, 1030, 1123, 1215, 1307]
+DIGIT_CENTER_X = [(DIGIT_BOX_XS[i] + DIGIT_BOX_XS[i + 1]) / 2 for i in range(8)]
 DIGIT_CENTER_Y_PX = 915
 
 
 def px_to_pt(x_px: float, y_px: float) -> Tuple[float, float]:
-    return x_px * SCALE, (BG_H_PX - y_px) * SCALE
+    """Convert image pixel coords (origin top-left) to PDF points (origin bottom-left)."""
+    x_pt = x_px * SCALE
+    y_pt = (BG_H_PX - y_px) * SCALE
+    return x_pt, y_pt
 
 
-def _font() -> str:
+def _draw_mark_rect(c: canvas.Canvas, x_px: float, y_px: float, size_px: float = 16, pad_px: float = 2) -> None:
+    """Draw a filled black square mark inside a checkbox area."""
+    x_pt = (x_px + pad_px) * SCALE
+    bottom_y_px = y_px + pad_px + size_px
+    y_pt = (BG_H_PX - bottom_y_px) * SCALE
+    w = size_px * SCALE
+    h = size_px * SCALE
+    c.saveState()
+    c.setFillColorRGB(0, 0, 0)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.rect(x_pt, y_pt, w, h, stroke=0, fill=1)
+    c.restoreState()
+
+
+def _try_register_tc_font() -> str:
+    """Prefer a Traditional Chinese font if present in ./fonts to avoid garbled Chinese in PDF."""
+    candidates = [
+        ('bkai00mp', os.path.join('fonts', 'bkai00mp.ttf')),
+        ('gkai00mp', os.path.join('fonts', 'gkai00mp.ttf')),
+    ]
+
+    here = os.path.dirname(__file__)
+    for name, rel_path in candidates:
+        full_path = rel_path if os.path.isabs(rel_path) else os.path.join(here, rel_path)
+        if os.path.isfile(full_path):
+            try:
+                pdfmetrics.registerFont(TTFont(name, full_path))
+                return name
+            except Exception:
+                pass
+
     try:
-        pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
-        return 'STSong-Light'
+        pdfmetrics.registerFont(UnicodeCIDFont('MSung-Light'))
+        return 'MSung-Light'
     except Exception:
         return 'Helvetica'
 
 
-def _safe(v: Any) -> str:
-    return '' if v is None else str(v).strip()
-
-
-def _to_int(v: Any) -> int:
-    try:
-        return int(Decimal(str(v or 0).replace(',', '')))
-    except (InvalidOperation, ValueError):
-        return 0
-
-
-def _draw_text(c: canvas.Canvas, text: str, x_px: float, y_px: float, size: int = 12, font: str = None):
+def _wrap_text(text: str, font_name: str, font_size: int, max_width_pt: float) -> List[str]:
+    """Simple CJK-friendly wrapping by characters."""
     if not text:
-        return
-    font = font or _font()
-    x, y = px_to_pt(x_px, y_px)
-    c.setFont(font, size)
-    c.drawString(x, y, str(text))
-
-
-def _draw_center(c: canvas.Canvas, text: str, x_px: float, y_px: float, size: int = 12, font: str = None):
-    if not text:
-        return
-    font = font or _font()
-    x, y = px_to_pt(x_px, y_px)
-    c.setFont(font, size)
-    c.drawCentredString(x, y, str(text))
-
-
-def _draw_fill_box(c: canvas.Canvas, x_px: float, y_px: float, size_px: float = 18):
-    x, y = px_to_pt(x_px, y_px + size_px)
-    s = size_px * SCALE
-    c.saveState()
-    c.setFillGray(0)
-    c.rect(x, y, s, s, fill=1, stroke=0)
-    c.restoreState()
-
-
-def _draw_line(c: canvas.Canvas, x1_px: float, y1_px: float, x2_px: float, y2_px: float, width: float = 1.0):
-    x1, y1 = px_to_pt(x1_px, y1_px)
-    x2, y2 = px_to_pt(x2_px, y2_px)
-    c.saveState()
-    c.setLineWidth(width)
-    c.line(x1, y1, x2, y2)
-    c.restoreState()
-
-
-def _draw_wrapped(c: canvas.Canvas, text: str, left_px: float, top_px: float, width_px: float, line_h_px: float, max_lines: int = 2, size: int = 12, font: str = None):
-    if not text:
-        return
-    font = font or _font()
-    max_w = width_px * SCALE
-    buf = ''
+        return []
     lines: List[str] = []
-    for ch in str(text).replace('\r', ''):
+    buf = ''
+    for ch in str(text):
         if ch == '\n':
             lines.append(buf)
             buf = ''
             continue
-        if pdfmetrics.stringWidth(buf + ch, font, size) <= max_w:
+        w = pdfmetrics.stringWidth(buf + ch, font_name, font_size)
+        if w <= max_width_pt:
             buf += ch
         else:
-            lines.append(buf)
+            if buf:
+                lines.append(buf)
             buf = ch
-        if len(lines) >= max_lines:
-            break
-    if buf and len(lines) < max_lines:
+    if buf:
         lines.append(buf)
-    c.setFont(font, size)
-    for i, line in enumerate(lines[:max_lines]):
-        x, y = px_to_pt(left_px, top_px + i * line_h_px)
-        c.drawString(x, y, line)
+    return lines
 
 
-def _extract_attachment_paths(record: Dict[str, Any], attachment_paths=None) -> List[str]:
+def _to_int_amount(amount_val: Any) -> int:
+    if amount_val in (None, ''):
+        return 0
+    try:
+        d = Decimal(str(amount_val).replace(',', '').strip())
+        return int(d)
+    except (InvalidOperation, ValueError):
+        return 0
+
+
+def _extract_attachment_paths(record: Dict[str, Any], attachment_paths: Optional[List[str]] = None) -> List[str]:
     out: List[str] = []
     src = attachment_paths if attachment_paths is not None else record.get('attachment_files') or record.get('attachments') or []
     if isinstance(src, str):
@@ -120,174 +125,264 @@ def _extract_attachment_paths(record: Dict[str, Any], attachment_paths=None) -> 
             src = [src]
     for item in src:
         if isinstance(item, dict):
-            p = _safe(item.get('path'))
+            p = str(item.get('path', '')).strip()
             if p:
                 out.append(p)
         elif isinstance(item, str):
-            p = _safe(item)
+            p = item.strip()
             if p:
                 out.append(p)
     return out
 
 
-def _image_grid_pdf_bytes(image_paths: List[str]) -> bytes:
+def _resolve_bg_image_path(bg_image_path: Optional[str] = None) -> str:
+    here = os.path.dirname(__file__)
+    candidates = []
+    if bg_image_path:
+        candidates.append(bg_image_path)
+        if not os.path.isabs(bg_image_path):
+            candidates.append(os.path.join(here, bg_image_path))
+    candidates.extend([
+        os.path.join(here, 'templates', DEFAULT_BG_NAME),
+        os.path.join(here, DEFAULT_BG_NAME),
+        DEFAULT_BG_NAME,
+    ])
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return candidates[0] if candidates else ''
+
+
+def _image_to_pdf_bytes(image_path: str) -> bytes:
+    """Convert a single image to a 1-page A4 PDF, scaled to fit with margins."""
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-    margin = 28
-    gap = 12
-    usable_w = PAGE_W - 2 * margin
-    usable_h = PAGE_H - 2 * margin
-    cols, rows = 2, 2
-    cell_w = (usable_w - gap) / cols
-    cell_h = (usable_h - gap) / rows
-    per_page = cols * rows
-    for idx, path in enumerate(image_paths):
-        if idx and idx % per_page == 0:
-            c.showPage()
-        slot = idx % per_page
-        col = slot % cols
-        row = slot // cols
-        x = margin + col * (cell_w + gap)
-        y = PAGE_H - margin - (row + 1) * cell_h - row * gap
-        try:
-            with Image.open(path) as im:
-                iw, ih = im.size
-        except Exception:
-            continue
-        ratio = iw / ih if ih else 1
-        box_ratio = cell_w / cell_h if cell_h else 1
-        if ratio >= box_ratio:
-            dw = cell_w; dh = cell_w / ratio
-        else:
-            dh = cell_h; dw = cell_h * ratio
-        dx = x + (cell_w - dw) / 2
-        dy = y + (cell_h - dh) / 2
-        c.drawImage(ImageReader(path), dx, dy, width=dw, height=dh, preserveAspectRatio=True, mask='auto')
+    page_w, page_h = A4
+    margin = 24
+
+    with Image.open(image_path) as im:
+        im = im.convert('RGB')
+        iw, ih = im.size
+        img_ratio = iw / ih if ih else 1.0
+
+    max_w = page_w - 2 * margin
+    max_h = page_h - 2 * margin
+    box_ratio = max_w / max_h if max_h else 1.0
+
+    if img_ratio >= box_ratio:
+        draw_w = max_w
+        draw_h = max_w / img_ratio
+    else:
+        draw_h = max_h
+        draw_w = max_h * img_ratio
+
+    x = (page_w - draw_w) / 2
+    y = (page_h - draw_h) / 2
+
+    c.drawImage(ImageReader(image_path), x, y, width=draw_w, height=draw_h, preserveAspectRatio=True, mask='auto')
+    c.showPage()
     c.save()
     return buf.getvalue()
 
 
-def _merge_attachments(base_pdf: bytes, paths: List[str]) -> bytes:
-    if not paths or not PdfReader or not PdfWriter:
+def _merge_attachments(base_pdf: bytes, attachment_paths: List[str]) -> bytes:
+    """Append attachment files (PDFs or images) after the first page."""
+    if not attachment_paths or not PdfWriter or not PdfReader:
         return base_pdf
+
     writer = PdfWriter()
-    for p in PdfReader(io.BytesIO(base_pdf)).pages:
+    base_reader = PdfReader(io.BytesIO(base_pdf))
+    for p in base_reader.pages:
         writer.add_page(p)
-    img_group: List[str] = []
 
-    def flush_imgs():
-        nonlocal img_group
-        if not img_group:
-            return
-        r = PdfReader(io.BytesIO(_image_grid_pdf_bytes(img_group)))
-        for p in r.pages:
-            writer.add_page(p)
-        img_group = []
-
-    for pth in paths:
+    for pth in attachment_paths:
         if not pth or not os.path.exists(pth):
             continue
-        low = pth.lower()
+        lower = pth.lower()
         try:
-            if low.endswith('.pdf'):
-                flush_imgs()
-                for p in PdfReader(pth).pages:
-                    writer.add_page(p)
-            elif low.endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp')):
-                img_group.append(pth)
+            if lower.endswith('.pdf'):
+                r = PdfReader(pth)
+                for page in r.pages:
+                    writer.add_page(page)
+            elif lower.endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp')):
+                img_pdf = _image_to_pdf_bytes(pth)
+                r = PdfReader(io.BytesIO(img_pdf))
+                for page in r.pages:
+                    writer.add_page(page)
         except Exception:
             continue
-    flush_imgs()
-    out = io.BytesIO(); writer.write(out); return out.getvalue()
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
-def _roc_ymd(date_str: str):
-    m = re.match(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', _safe(date_str))
-    if not m:
-        return '', '', ''
-    y, mo, d = m.groups()
-    return str(int(y)-1911), f'{int(mo):02d}', f'{int(d):02d}'
+def _resolve_build_args(bg_image_path=None, attachment_paths=None):
+    """Support both old and new call signatures.
+
+    Accepted patterns:
+    - build_pdf_bytes(record)
+    - build_pdf_bytes(record, attachment_paths=[...])
+    - build_pdf_bytes(record, bg_image_path='...')
+    - build_pdf_bytes(record, 'path/to/bg.png', [...])
+    - build_pdf_bytes(record, [...])  # legacy positional attachment paths
+    """
+    bg = None
+    atts = None
+
+    if isinstance(bg_image_path, (list, tuple)) and attachment_paths is None:
+        atts = list(bg_image_path)
+    else:
+        bg = bg_image_path
+        atts = attachment_paths
+
+    if atts is None:
+        atts = []
+    return bg, list(atts)
 
 
-def _form_id(record: Dict[str, Any]) -> str:
-    rid = _safe(record.get('record_id'))
-    if rid:
-        return rid
-    emp = _safe(record.get('employee_no')) or '00000'
-    y, m, d = _roc_ymd(_safe(record.get('form_date')))
-    roc = f'{int(y):03d}{m}{d}' if y else '0000000'
-    return f'EX{emp}{roc}001'
-
-
-def _draw_alignment_overlays(c: canvas.Canvas):
-    # 1) employee name / employee no underline slightly lower
-    _draw_line(c, 448, 560, 706, 560, 0.8)
-    _draw_line(c, 947, 560, 1123, 560, 0.8)
-
-    # 2) vendor section full height down to payee bottom line
-    # reinforce bottom boundary of vendor block at same level as payee underline
-    _draw_line(c, 286, 913, 1289, 913, 0.8)
-    # reinforce left vertical of payment section to vendor bottom
-    _draw_line(c, 286, 488, 286, 913, 0.8)
-
-    # 3) extend receipt-number lower gridline through amount title cell
-    _draw_line(c, 286, 941, 495, 941, 0.8)
-
-
-def build_pdf_bytes(record: Dict[str, Any], attachment_paths=None, bg_image_path: str | None = None) -> bytes:
-    font = _font()
+def build_pdf_bytes(record: Dict[str, Any], bg_image_path=None, attachment_paths=None) -> bytes:
+    bg_image_path, attachment_paths = _resolve_build_args(bg_image_path, attachment_paths)
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
 
-    bg_path = bg_image_path if bg_image_path is not None and str(bg_image_path).strip() else BG_PATH
-    if os.path.exists(bg_path):
-        c.drawImage(ImageReader(bg_path), 0, 0, width=PAGE_W, height=PAGE_H)
+    resolved_bg = _resolve_bg_image_path(bg_image_path)
+    if resolved_bg and os.path.exists(resolved_bg):
+        c.drawImage(ImageReader(resolved_bg), 0, 0, width=PAGE_W, height=PAGE_H, mask='auto')
 
-    _draw_alignment_overlays(c)
+    font = _try_register_tc_font()
+    c.setFont(font, 11)
 
-    _draw_text(c, f'表單ID：{_form_id(record)}', 1125, 160, 9, font)
-    y, m, d = _roc_ymd(record.get('form_date', ''))
-    _draw_center(c, y, 1167, 297, 15, font)
-    _draw_center(c, m, 1254, 297, 15, font)
-    _draw_center(c, d, 1338, 297, 15, font)
+    form_date = record.get('form_date', '')
+    ymd = None
+    if form_date:
+        s = str(form_date).strip()
+        try:
+            date_obj = datetime.fromisoformat(s.replace('/', '-')).date()
+            ymd = (date_obj.year, date_obj.month, date_obj.day)
+        except Exception:
+            m = re.match(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', s)
+            if m:
+                ymd = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
-    _draw_text(c, _safe(record.get('plan_code')), 387, 392, 13, font)
-    purpose = _safe(record.get('purpose_desc') or record.get('purpose') or record.get('trip_purpose'))
-    _draw_wrapped(c, purpose, 387, 470, 900, 24, max_lines=2, size=12, font=font)
+    if ymd:
+        y_px = 346
+        x_year, y = px_to_pt(1111, y_px)
+        x_month, y = px_to_pt(1199, y_px)
+        x_day, y = px_to_pt(1290, y_px)
+        c.drawRightString(x_year, y, f'{ymd[0]:04d}')
+        c.drawRightString(x_month, y, f'{ymd[1]:02d}')
+        c.drawRightString(x_day, y, f'{ymd[2]:02d}')
+    else:
+        s = str(form_date).strip()
+        if s:
+            x, y = px_to_pt(943, 356)
+            c.drawString(x, y, s)
 
-    target = _safe(record.get('payment_target_type') or (
-        'employee' if str(record.get('employee_enabled')).lower() in {'true','1','yes'} else
-        'advance_offset' if str(record.get('advance_offset_enabled')).lower() in {'true','1','yes'} else
-        'vendor' if str(record.get('vendor_enabled')).lower() in {'true','1','yes'} else ''
-    ))
-    if target == 'employee':
-        _draw_fill_box(c, 377, 535, 18)
-        _draw_text(c, _safe(record.get('employee_name')), 512, 556, 12, font)
-        _draw_text(c, _safe(record.get('employee_no')), 920, 556, 12, font)
-    elif target == 'advance_offset':
-        _draw_fill_box(c, 377, 616, 18)
-        _draw_text(c, _safe(record.get('advance_amount')), 421, 684, 12, font)
-        _draw_text(c, _safe(record.get('offset_amount')), 654, 684, 12, font)
-        _draw_text(c, _safe(record.get('refund_amount')), 906, 684, 12, font)
-        _draw_text(c, _safe(record.get('supplement_amount')), 1160, 684, 12, font)
-    elif target == 'vendor':
-        _draw_fill_box(c, 377, 741, 18)
-        _draw_text(c, _safe(record.get('vendor_name')), 514, 802, 12, font)
-        _draw_text(c, _safe(record.get('vendor_address')), 515, 852, 12, font)
-        _draw_text(c, _safe(record.get('payee_name')), 515, 896, 12, font)
+    x, y = px_to_pt(425, 395)
+    c.drawString(x, y, str(record.get('plan_code', '')))
 
-    _draw_text(c, _safe(record.get('receipt_count') or record.get('receipt_no')), 389, 941, 12, font)
-    amount_total = _to_int(record.get('amount_total') or record.get('amount') or record.get('total_amount'))
-    digits = list(str(amount_total).zfill(8)[-8:])
-    for xpx, ch in zip(DIGIT_CENTER_X, digits):
-        _draw_center(c, ch, xpx, DIGIT_CENTER_Y_PX, 16, font)
+    purpose = str(record.get('purpose_desc') or record.get('purpose') or '')
+    max_w = (1300 - 403) * SCALE
+    lines = _wrap_text(purpose, font, 11, max_w)
+    start_x, start_y = px_to_pt(403, 480)
+    line_h = 14
+    for i, line in enumerate(lines[:3]):
+        c.drawString(start_x, start_y - i * line_h, line)
 
+    mode = str(record.get('payment_mode') or record.get('payment_target_type') or '').strip()
+    if mode == 'advance_offset':
+        mode = 'advance'
+
+    is_adv = str(record.get('is_advance_offset', '')).lower() in ('true', '1', 'yes') or str(record.get('advance_offset_enabled', '')).lower() in ('true', '1', 'yes')
+    is_vendor = (
+        str(record.get('is_direct_vendor_pay', '')).lower() in ('true', '1', 'yes')
+        or record.get('payee_type', '') == 'vendor'
+        or str(record.get('vendor_enabled', '')).lower() in ('true', '1', 'yes')
+    )
+    is_employee = str(record.get('employee_enabled', '')).lower() in ('true', '1', 'yes')
+
+    if mode not in ('employee', 'advance', 'vendor'):
+        if is_adv:
+            mode = 'advance'
+        elif is_vendor:
+            mode = 'vendor'
+        elif is_employee:
+            mode = 'employee'
+        else:
+            mode = 'employee'
+
+    if mode == 'employee':
+        _draw_mark_rect(c, 400, 528, size_px=18, pad_px=4)
+    elif mode == 'advance':
+        _draw_mark_rect(c, 400, 588, size_px=18, pad_px=4)
+    elif mode == 'vendor':
+        _draw_mark_rect(c, 400, 738, size_px=18, pad_px=4)
+    c.setFont(font, 11)
+
+    x, y = px_to_pt(562, 546)
+    c.drawString(x, y, str(record.get('employee_name', '')))
+    x, y = px_to_pt(923, 546)
+    c.drawString(x, y, str(record.get('employee_no', '')))
+
+    show_adv = mode == 'advance' or is_adv
+    if show_adv:
+        _draw_mark_rect(c, 400, 588, size_px=18, pad_px=4)
+        c.setFont(font, 11)
+
+        x, y = px_to_pt(548, 667)
+        c.drawString(x, y, str(int(record.get('advance_amount') or 0)))
+        x, y = px_to_pt(760, 667)
+        c.drawString(x, y, str(int(record.get('offset_amount') or 0)))
+        x, y = px_to_pt(965, 667)
+        c.drawString(x, y, str(int(record.get('balance_refund_amount') or record.get('refund_amount') or 0)))
+        x, y = px_to_pt(1178, 667)
+        c.drawString(x, y, str(int(record.get('supplement_amount') or 0)))
+
+    x, y = px_to_pt(600, 760)
+    c.drawString(x, y, str(record.get('vendor_name', '')))
+    x, y = px_to_pt(600, 800)
+    c.drawString(x, y, str(record.get('vendor_address', '')))
+    x, y = px_to_pt(600, 835)
+    c.drawString(x, y, str(record.get('vendor_payee_name') or record.get('payee_name') or '',))
+
+    x, y = px_to_pt(210, 915)
+    c.drawString(x, y, str(record.get('receipt_no') or record.get('receipt_count') or ''))
+
+    amt_int = _to_int_amount(record.get('amount_total') or record.get('amount') or record.get('total_amount'))
+    if 0 <= amt_int <= 99999999:
+        digits = f'{amt_int:08d}'
+        c.setFont(font, 14)
+        for i, dch in enumerate(digits):
+            cx_pt, cy_pt = px_to_pt(DIGIT_CENTER_X[i], DIGIT_CENTER_Y_PX)
+            c.drawCentredString(cx_pt, cy_pt - 5, dch)
+        c.setFont(font, 11)
+
+    sig_y_px = 1048
+    sig_specs = [
+        ('handler_name', 229),
+        ('project_manager_name', 484),
+        ('dept_manager_name', 776),
+        ('accountant_name', 1051),
+    ]
+    for key, x_px in sig_specs:
+        val = str(record.get(key, '')).strip()
+        if val:
+            x, y = px_to_pt(x_px, sig_y_px)
+            c.drawCentredString(x, y, val)
+
+    c.showPage()
     c.save()
-    base = buf.getvalue()
-    return _merge_attachments(base, _extract_attachment_paths(record, attachment_paths))
+
+    base_pdf = buf.getvalue()
+    merged_paths = _extract_attachment_paths(record, attachment_paths)
+    if merged_paths:
+        return _merge_attachments(base_pdf, merged_paths)
+    return base_pdf
 
 
 def merge_expense_pdf_with_attachments(record_or_pdf, attachment_paths=None) -> bytes:
+    """Compatibility wrapper used by expense.py / apps.expense.py."""
     if isinstance(record_or_pdf, (bytes, bytearray)):
         return _merge_attachments(bytes(record_or_pdf), attachment_paths or [])
     return build_pdf_bytes(record_or_pdf, attachment_paths=attachment_paths)

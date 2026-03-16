@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -175,140 +176,20 @@ def _split_expense_export_frames(actor: Actor) -> tuple[pd.DataFrame, pd.DataFra
     return draft_df, submitted_df
 
 
-def _expense_master_cache_key(actor: Actor) -> str:
-    return f"expense_master_bundle::{actor.email.lower()}"
-
-
-def _expense_export_signature(df: pd.DataFrame) -> str:
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return "empty"
-    cols = [c for c in ["record_id", "status", "updated_at", "user_email", "amount_total"] if c in df.columns]
-    if not cols:
-        cols = list(df.columns[:10])
-    return df[cols].copy().fillna("").to_json(orient="records", force_ascii=False)
-
-
-
-
-def _expense_filter_cache_token(df: pd.DataFrame, status_default: str) -> str:
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return f"{status_default}::empty"
-    cols = [c for c in ["record_id", "status", "form_date", "owner_name", "plan_code", "amount_total", "amount_untaxed", "tax_amount", "purpose_desc", "updated_at", "user_email"] if c in df.columns]
-    if not cols:
-        cols = list(df.columns[:12])
-    return f"{status_default}::" + df[cols].copy().fillna("").to_json(orient="split", force_ascii=False, date_format="iso")
-
-
-@st.cache_data(show_spinner=False)
-def _prepare_expense_filterable_df(cache_token: str, df: pd.DataFrame, status_default: str) -> pd.DataFrame:
-    filtered = df.copy().fillna("") if isinstance(df, pd.DataFrame) else pd.DataFrame()
-    if filtered.empty:
-        return filtered
-    if "status" not in filtered.columns:
-        filtered["status"] = status_default if status_default in {"draft", "submitted", "deleted", "void"} else "draft"
-    records = filtered.to_dict(orient="records")
-    owner_names = [_owner_text(r) for r in records]
-    record_ids = [str(r.get("record_id") or r.get("id") or "") for r in records]
-    month_texts = [_month_text(r.get("form_date", "")) for r in records]
-    filtered = filtered.copy()
-    filtered["owner_name"] = owner_names
-    filtered["record_id_text"] = record_ids
-    filtered["month_text"] = month_texts
-    filtered["plan_text"] = filtered.get("plan_code", "").astype(str)
-    filtered["status"] = filtered["status"].astype(str).str.lower()
-    if "amount_untaxed" in filtered.columns:
-        filtered["amount_untaxed_int"] = filtered["amount_untaxed"].apply(safe_int)
-    else:
-        filtered["amount_untaxed_int"] = 0
-    if "tax_amount" in filtered.columns:
-        filtered["tax_amount_int"] = filtered["tax_amount"].apply(safe_int)
-    else:
-        filtered["tax_amount_int"] = 0
-    if "amount_total" in filtered.columns:
-        filtered["amount_total_int"] = filtered["amount_total"].apply(safe_int)
-    else:
-        filtered["amount_total_int"] = 0
-    return filtered
-
-
-@st.cache_data(show_spinner=False)
-def _filter_expense_df_cached(cache_token: str, prepared_df: pd.DataFrame, status_value: str, owner_value: str, plan_value: str, record_value: str, start_value: str, end_value: str) -> pd.DataFrame:
-    filtered = prepared_df.copy() if isinstance(prepared_df, pd.DataFrame) else pd.DataFrame()
-    if filtered.empty:
-        return filtered
-    if status_value != "all":
-        filtered = filtered[filtered["status"] == status_value]
-    if owner_value.strip():
-        filtered = filtered[filtered["owner_name"].str.contains(owner_value.strip(), case=False, na=False)]
-    if plan_value.strip():
-        filtered = filtered[filtered["plan_text"].str.contains(plan_value.strip(), case=False, na=False)]
-    if record_value.strip():
-        filtered = filtered[filtered["record_id_text"].str.contains(record_value.strip(), case=False, na=False)]
-    if start_value.strip():
-        filtered = filtered[filtered["month_text"] >= start_value.strip()]
-    if end_value.strip():
-        filtered = filtered[filtered["month_text"] <= end_value.strip()]
-    return filtered
-
-
-@st.cache_data(show_spinner=False)
-def _expense_page_metrics_cached(cache_token: str, page_df: pd.DataFrame) -> tuple[int, int, int, int, int]:
-    if not isinstance(page_df, pd.DataFrame) or page_df.empty:
-        return 0, 0, 0, 0, 0
-    untaxed_sum = int(page_df.get("amount_untaxed_int", 0).sum()) if "amount_untaxed_int" in page_df.columns else 0
-    tax_sum = int(page_df.get("tax_amount_int", 0).sum()) if "tax_amount_int" in page_df.columns else 0
-    total_sum = int(page_df.get("amount_total_int", 0).sum()) if "amount_total_int" in page_df.columns else 0
-    count = len(page_df)
-    avg = int(round(total_sum / count)) if count else 0
-    return untaxed_sum, tax_sum, total_sum, count, avg
-
-def _get_expense_master_bundle(actor: Actor, force_refresh: bool = False) -> Tuple[pd.DataFrame, str]:
-    cache_key = _expense_master_cache_key(actor)
-    if force_refresh:
-        st.session_state.pop(cache_key, None)
-    cached = st.session_state.get(cache_key)
-    if cached and isinstance(cached, tuple) and len(cached) == 2:
-        return cached
-
-    def _fetch_cloud_rows() -> Any:
-        return get_api().records_df(actor=actor, status=None, owner_only=False)
-
-    local_rows = _expense_local_rows(actor)
-    df, report = build_master_dataframe('expense', actor.email, _fetch_cloud_rows, local_rows=local_rows)
-    source = 'cloud' if report.get('cloud_online') else ('local' if report.get('local_count') else report.get('cloud_source', 'empty'))
-    if not df.empty:
-        df = df.copy().fillna('')
-        if 'record_id' in df.columns:
-            df = df.drop_duplicates(subset=['record_id'], keep='last')
-    st.session_state[cache_key] = (df, source)
-    st.session_state[f"{cache_key}::report"] = report
-    return df, source
-
-
-def _build_expense_workbook_from_frames(draft_df: pd.DataFrame, submitted_df: pd.DataFrame) -> bytes:
+def _build_expense_workbook_bytes(actor: Actor) -> bytes:
     from io import BytesIO
+
+    draft_df, submitted_df = _split_expense_export_frames(actor)
+
     draft_export = _build_schema_export_df(draft_df, EXPENSE_EXPORT_SCHEMA)
     submitted_export = _build_schema_export_df(submitted_df, EXPENSE_EXPORT_SCHEMA)
+
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         submitted_export.to_excel(writer, sheet_name="申請列表", index=False, header=False)
         draft_export.to_excel(writer, sheet_name="草稿列表", index=False, header=False)
     bio.seek(0)
     return bio.getvalue()
-
-
-def _maybe_write_expense_cloud_backup(actor: Actor, draft_df: pd.DataFrame, submitted_df: pd.DataFrame) -> None:
-    cache_key = f"expense_cloud_backup_sig::{actor.email.lower()}"
-    signature = _expense_export_signature(draft_df) + '||' + _expense_export_signature(submitted_df)
-    if st.session_state.get(cache_key) == signature:
-        return
-    save_cloud_backup_excel({"申請列表": submitted_df, "草稿列表": draft_df})
-    st.session_state[cache_key] = signature
-
-
-def _build_expense_workbook_bytes(actor: Actor) -> bytes:
-    draft_df, submitted_df = _split_expense_export_frames(actor)
-    return _build_expense_workbook_from_frames(draft_df, submitted_df)
 
 
 @st.cache_resource(show_spinner=False)
@@ -456,6 +337,40 @@ def _expense_local_rows(actor: Actor) -> List[Dict[str, Any]]:
     return load_local_expense_drafts(actor.email) or []
 
 
+def _expense_cloud_rows(actor: Actor) -> List[Dict[str, Any]]:
+    owner_only = not is_admin(actor)
+    return get_api().record_list_all(actor=actor, status=None, owner_only=owner_only)
+
+
+def _load_expense_master(actor: Actor, force_refresh: bool = False) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    cache_key = f"expense_master_cache::{actor.email}::{actor.role}"
+    if (not force_refresh) and cache_key in st.session_state:
+        return st.session_state[cache_key]
+    df, report = build_master_dataframe(
+        'expense',
+        actor.email,
+        fetch_cloud_rows=lambda: _expense_cloud_rows(actor),
+        local_rows=_expense_local_rows(actor),
+    )
+    if not df.empty:
+        df = df.copy().fillna('')
+        if 'status' not in df.columns:
+            df['status'] = 'draft'
+        if 'owner_name' not in df.columns:
+            df['owner_name'] = df.get('employee_name', '')
+    st.session_state[cache_key] = (df, report)
+    st.session_state['expense_sync_report'] = report
+    st.session_state['cloud_online_expense'] = bool(report.get('cloud_online', False))
+    return df, report
+
+
+def _invalidate_expense_master(actor: Optional[Actor]) -> None:
+    if not actor:
+        return
+    for suffix in [f"expense_master_cache::{actor.email}::{actor.role}", f"expense_master_cache::{actor.email}::admin", f"expense_master_cache::{actor.email}::user"]:
+        st.session_state.pop(suffix, None)
+
+
 def _queue_and_try_sync_expense(actor: Actor, operation: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
     payload = dict(payload or {})
     payload['system_type'] = 'expense'
@@ -463,6 +378,8 @@ def _queue_and_try_sync_expense(actor: Actor, operation: str, payload: Dict[str,
     queue_pending_sync(operation, {'email': actor.email, 'name': actor.name, 'role': actor.role}, payload, queue_owner_email=payload['user_email'])
     try:
         result = sync_pending_events('expense', actor, get_api())
+        _invalidate_expense_master(actor)
+        _load_expense_master(actor, force_refresh=True)
         if result.get('failed', 0) == 0:
             st.session_state['cloud_online_expense'] = True
             return True, ''
@@ -473,42 +390,54 @@ def _queue_and_try_sync_expense(actor: Actor, operation: str, payload: Dict[str,
         return False, str(exc)
 
 def load_records_cloud_or_backup(actor: Actor, status: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
-    df, source = _get_expense_master_bundle(actor)
-    if df.empty:
+    try:
+        df = get_api().records_df(actor=actor, status=status, owner_only=False).fillna("")
+        local_rows = load_local_expense_drafts(actor.email)
+        if local_rows:
+            local_df = pd.DataFrame(local_rows).fillna("")
+            if not df.empty:
+                if status:
+                    local_df = local_df[local_df.get("status", "").astype(str).str.lower() == status]
+                df = pd.concat([df, local_df], ignore_index=True).fillna("")
+                df = df.drop_duplicates(subset=["record_id"], keep="last") if "record_id" in df.columns else df
+            elif status == "draft":
+                df = local_df
+                return df.fillna(""), "local"
+        if status is None:
+            df_copy = df.copy().fillna("")
+            if not df_copy.empty:
+                if "status" not in df_copy.columns:
+                    df_copy["status"] = "draft"
+                status_series = df_copy["status"].astype(str).str.lower()
+                draft_cloud = df_copy[status_series.isin(["draft", "deleted"])].copy()
+                submitted_cloud = df_copy[status_series.isin(["submitted", "void"])].copy()
+            else:
+                draft_cloud = pd.DataFrame()
+                submitted_cloud = pd.DataFrame()
+            save_cloud_backup_excel({"申請列表": submitted_cloud, "草稿列表": draft_cloud})
+        elif status == "submitted":
+            save_cloud_backup_excel({"申請列表": df})
+        elif status == "draft":
+            save_cloud_backup_excel({"草稿列表": df})
+        return df, "cloud"
+    except Exception:
+        if status in {"draft", None}:
+            local_rows = load_local_expense_drafts(actor.email)
+            if local_rows:
+                df_local = pd.DataFrame(local_rows).fillna("")
+                if status:
+                    status_series = df_local.get("status", pd.Series(dtype=str)).astype(str).str.lower()
+                    df_local = df_local[status_series == status]
+                return df_local, "local"
         if status == "submitted":
-            backup_df = load_backup_sheet_df("申請列表")
-            if backup_df.empty:
-                backup_df = load_backup_sheet_df("申請表單")
+            df = load_backup_sheet_df("申請列表")
+            if df.empty:
+                df = load_backup_sheet_df("申請表單")
         else:
-            backup_df = load_backup_sheet_df("草稿列表")
-        if not backup_df.empty:
-            backup_df = backup_df.fillna("")
-            if status is None:
-                return backup_df, "backup"
-            if "status" not in backup_df.columns:
-                backup_df["status"] = "draft"
-            status_series = backup_df["status"].astype(str).str.lower()
-            if status == "draft":
-                return backup_df[status_series.isin(["draft", "deleted"])].copy(), "backup"
-            if status == "submitted":
-                return backup_df[status_series.isin(["submitted", "void"])].copy(), "backup"
-            return backup_df, "backup"
-        return df, source
-
-    out = df.copy().fillna("")
-    if "status" not in out.columns:
-        out["status"] = "draft"
-    status_series = out["status"].astype(str).str.lower()
-    if status == "draft":
-        out = out[status_series.isin(["draft", "deleted"])].copy()
-    elif status == "submitted":
-        out = out[status_series.isin(["submitted", "void"])].copy()
-    _maybe_write_expense_cloud_backup(
-        actor,
-        df[status_series.isin(["draft", "deleted"])].copy() if not df.empty else pd.DataFrame(),
-        df[status_series.isin(["submitted", "void"])].copy() if not df.empty else pd.DataFrame(),
-    )
-    return out, source
+            df = load_backup_sheet_df("草稿列表")
+        if not df.empty:
+            return df.fillna(""), "backup"
+        return pd.DataFrame(), "empty"
 
 
 def refresh_runtime_cache(actor: Actor) -> None:
@@ -517,9 +446,7 @@ def refresh_runtime_cache(actor: Actor) -> None:
     cache_key = f"expense_defaults_{actor.email.lower()}"
     st.session_state.pop(cache_key, None)
     st.session_state.pop(f"{cache_key}_source", None)
-    st.session_state.pop(_expense_master_cache_key(actor), None)
-    st.session_state.pop(f"{_expense_master_cache_key(actor)}::report", None)
-    st.session_state.pop(f"expense_cloud_backup_sig::{actor.email.lower()}", None)
+    _invalidate_expense_master(actor)
 
 
 def _expense_archive_restore_status(row: Dict[str, Any]) -> str:
@@ -564,28 +491,21 @@ def _render_deleted_archive_restore_expense(actor: Actor) -> None:
         payload = _expense_restore_payload(selected_row)
         target_status = str(payload.get("status", "draft")).strip().lower() or "draft"
         owner_email = str(payload.get("user_email") or actor.email or "").strip().lower()
-        try:
-            if target_status == "submitted":
-                get_api().record_submit(actor=actor, payload=payload)
-            else:
-                get_api().record_save_draft(actor=actor, payload=payload)
-            upsert_local_expense_draft(owner_email, payload)
-            mark_deleted_archive_restored(str(selected_row.get("archive_id", "")), restored_by=actor.email, restore_target_status=target_status)
-            refresh_runtime_cache(actor)
+        upsert_local_expense_draft(owner_email, payload)
+        ok, msg = _queue_and_try_sync_expense(actor, f"expense_restore_{target_status}", payload)
+        mark_deleted_archive_restored(str(selected_row.get("archive_id", "")), restored_by=actor.email, restore_target_status=target_status)
+        refresh_runtime_cache(actor)
+        if ok:
             st.sidebar.success(f"已還原：{payload.get('record_id','')}")
-            st.rerun()
-        except Exception as e:
-            upsert_local_expense_draft(owner_email, payload)
-            queue_pending_sync(f"expense_restore_{target_status}", {"email": actor.email, "name": actor.name}, payload, queue_owner_email=owner_email)
-            mark_deleted_archive_restored(str(selected_row.get("archive_id", "")), restored_by=actor.email, restore_target_status=target_status)
-            refresh_runtime_cache(actor)
-            st.sidebar.warning(f"雲端即時還原失敗，已轉為待同步還原：{e}")
-            st.rerun()
+        else:
+            st.sidebar.warning(f"已加入待同步還原：{msg or '請稍後重新同步'}")
+        st.rerun()
 
 
 def render_sync_status_sidebar_expense(current_user_email: str) -> None:
     if not current_user_email:
         return
+    actor = get_current_actor() or Actor(name="", email=current_user_email, role="user")
     pending_count = count_pending_sync(current_user_email, system_type="expense")
     st.sidebar.markdown("---")
     st.sidebar.subheader("雲端同步狀態")
@@ -602,14 +522,15 @@ def render_sync_status_sidebar_expense(current_user_email: str) -> None:
     cloud_url = _get_cloud_excel_url()
     if cloud_url:
         st.sidebar.link_button("開啟雲端表單", cloud_url, use_container_width=True)
+    st.sidebar.link_button("開啟附件雲端資料夾", EXPENSE_ATTACHMENTS_ROOT_URL, use_container_width=True)
 
+    _load_expense_master(actor, force_refresh=False)
     draft_cloud_df, submitted_cloud_df = _split_expense_export_frames(actor)
-    _maybe_write_expense_cloud_backup(actor, draft_cloud_df, submitted_cloud_df)
-    workbook_bytes = _build_expense_workbook_from_frames(draft_cloud_df, submitted_cloud_df)
+    save_cloud_backup_excel({"申請列表": submitted_cloud_df, "草稿列表": draft_cloud_df})
 
     st.sidebar.download_button(
         "下載Excel",
-        data=workbook_bytes,
+        data=_build_expense_workbook_bytes(actor),
         file_name="支出報帳.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
@@ -618,17 +539,26 @@ def render_sync_status_sidebar_expense(current_user_email: str) -> None:
 
     _render_deleted_archive_restore_expense(actor)
 
-    if st.sidebar.button("立即同步支出資料", key="sync_expense_now_btn"):
-        result = sync_pending_events('expense', actor, get_api())
-        refresh_runtime_cache(actor)
-        st.session_state['cloud_online_expense'] = (result.get('failed', 0) == 0)
-        if result.get('synced', 0) == 0 and result.get('failed', 0) == 0:
-            st.sidebar.info("目前沒有待同步的支出資料。")
-        elif result.get('failed', 0) == 0:
-            st.sidebar.success(f"同步完成：{result.get('synced', 0)} 筆")
-        else:
-            st.sidebar.warning(f"同步完成：成功 {result.get('synced', 0)} 筆，失敗 {result.get('failed', 0)} 筆，剩餘 {result.get('remaining', 0)} 筆")
+    report = st.session_state.get('expense_sync_report', {}) or {}
+    st.sidebar.caption(f"master={report.get('master_count', 0)}｜cloud={report.get('cloud_count', 0)}｜pending={report.get('pending_count', 0)}")
+    if report.get('cloud_count', 0) != report.get('master_count', 0) and report.get('pending_count', 0) == 0:
+        st.sidebar.warning('偵測到雲端與前端筆數不一致，建議重新同步或重新整理。')
 
+    if st.sidebar.button("立即同步支出資料", key="sync_expense_now_btn", use_container_width=True):
+        try:
+            result = sync_pending_events('expense', actor, get_api())
+            _invalidate_expense_master(actor)
+            _load_expense_master(actor, force_refresh=True)
+            st.session_state['cloud_online_expense'] = result.get('failed', 0) == 0
+            if result.get('synced', 0) == 0 and result.get('failed', 0) == 0:
+                st.sidebar.info("目前沒有待同步的支出資料。")
+            elif result.get('failed', 0) == 0:
+                st.sidebar.success(f"同步完成：{result.get('synced', 0)} 筆")
+            else:
+                st.sidebar.warning(f"同步完成：成功 {result.get('synced', 0)} 筆，失敗 {result.get('failed', 0)} 筆")
+        except Exception as e:
+            st.session_state['cloud_online_expense'] = False
+            st.sidebar.error(f"同步失敗：{e}")
 
 def render_top_sync_notice_expense(current_user_email: str) -> None:
     if not current_user_email:
@@ -808,19 +738,55 @@ def copy_record_into_form(record: Dict[str, Any], actor: Actor, grouped_options:
     st.session_state["expense_page"] = "new"
 
 
+def _upload_file_to_drive(actor: Actor, up, category: str, record_id: str = '') -> Dict[str, Any]:
+    if hasattr(get_api(), 'upload_drive_file'):
+        return get_api().upload_drive_file(
+            actor,
+            filename=getattr(up, 'name', 'file.bin'),
+            file_bytes=up.getvalue(),
+            mime_type=getattr(up, 'type', 'application/octet-stream') or 'application/octet-stream',
+            category=category,
+            record_id=record_id,
+            owner_email=actor.email,
+        )
+    return save_uploaded_attachment(actor.email, up, category)
+
+
+def _delete_attachment_meta(actor: Actor, meta: Dict[str, Any]) -> None:
+    drive_file_id = str((meta or {}).get('drive_file_id', '')).strip()
+    if drive_file_id and hasattr(get_api(), 'delete_drive_file'):
+        try:
+            get_api().delete_drive_file(actor, drive_file_id)
+            return
+        except Exception:
+            pass
+    delete_saved_file(meta)
+
+
+def _download_attachment_bytes(actor: Actor, meta: Dict[str, Any]) -> Tuple[bytes, str, str]:
+    drive_file_id = str((meta or {}).get('drive_file_id', '')).strip()
+    if drive_file_id and hasattr(get_api(), 'download_drive_file'):
+        data = get_api().download_drive_file(actor, drive_file_id)
+        return data.get('file_bytes', b''), str(data.get('name') or meta.get('name') or 'attachment.bin'), str(data.get('mime_type') or meta.get('mime_type') or 'application/octet-stream')
+    path = str((meta or {}).get('path', '')).strip()
+    if path and Path(path).exists():
+        return Path(path).read_bytes(), Path(path).name, str(meta.get('mime_type') or 'application/octet-stream')
+    return b'', str(meta.get('name') or 'attachment.bin'), str(meta.get('mime_type') or 'application/octet-stream')
+
+
 def remove_attachment_from_form(actor: Actor, idx: int) -> None:
     form_data = dict(st.session_state.get(_form_key(actor), {}) or {})
     files = list(form_data.get("attachment_files", []) or [])
     if 0 <= idx < len(files):
         meta = files.pop(idx)
-        delete_saved_file(meta)
+        _delete_attachment_meta(actor, meta)
         form_data["attachment_files"] = files
         set_form_data(actor, form_data)
 
 
 def remove_signature_from_form(actor: Actor) -> None:
     form_data = dict(st.session_state.get(_form_key(actor), {}) or {})
-    delete_saved_file(form_data.get("signature_file", {}))
+    _delete_attachment_meta(actor, form_data.get("signature_file", {}))
     form_data["signature_file"] = {}
     set_form_data(actor, form_data)
 
@@ -872,10 +838,10 @@ def _persist_uploaded_files(actor: Actor, payload: Dict[str, Any]) -> Dict[str, 
         marker = (up.name, len(up.getvalue()))
         if any((r.get("name"), int(r.get("size", 0))) == marker for r in existing_attachments if str(r.get("size", "")).isdigit()):
             continue
-        existing_attachments.append(save_uploaded_attachment(actor.email, up, "attachment"))
-    uploaded_sig = st.session_state.get(EXPENSE_WIDGET_KEYS["signature"])
+        existing_attachments.append(_upload_file_to_drive(actor, up, 'attachment', record_id=str(payload.get('record_id') or '')))
+    uploaded_sig = st.session_state.get(EXPENSE_WIDGET_KEYS['signature'])
     if uploaded_sig is not None:
-        sig_meta = save_signature_file(actor.email, uploaded_sig)
+        sig_meta = _upload_file_to_drive(actor, uploaded_sig, 'signature', record_id=str(payload.get('record_id') or ''))
     payload["attachment_files"] = existing_attachments
     payload["signature_file"] = sig_meta
     return payload
@@ -941,14 +907,30 @@ def _select_or_value_for_payload(field_name: str) -> str:
 
 
 def _prepare_pdf_bytes(payload: Dict[str, Any]) -> bytes:
-    attachment_paths = []
-    for x in (payload.get("attachment_files", []) or []):
-        if isinstance(x, dict):
-            p = str(x.get("path", "")).strip()
-        else:
+    attachment_paths: List[str] = []
+    actor = get_current_actor()
+    for idx, x in enumerate(payload.get('attachment_files', []) or []):
+        if not isinstance(x, dict):
             p = str(x).strip()
-        if p:
+            if p:
+                attachment_paths.append(p)
+            continue
+        p = str(x.get('path', '')).strip()
+        if p and Path(p).exists():
             attachment_paths.append(p)
+            continue
+        drive_file_id = str(x.get('drive_file_id', '')).strip()
+        if actor and drive_file_id and hasattr(get_api(), 'download_drive_file'):
+            try:
+                data = get_api().download_drive_file(actor, drive_file_id)
+                file_bytes = data.get('file_bytes', b'')
+                if file_bytes:
+                    suffix = Path(str(data.get('name') or x.get('name') or f'attachment_{idx}.bin')).suffix or '.bin'
+                    tmp = Path(tempfile.gettempdir()) / f"expense_attach_{drive_file_id}{suffix}"
+                    tmp.write_bytes(file_bytes)
+                    attachment_paths.append(str(tmp))
+            except Exception:
+                pass
     main = build_pdf_bytes(payload)
     return merge_expense_pdf_with_attachments(main, attachment_paths)
 
@@ -1019,20 +1001,38 @@ def render_form_page(grouped_options: Dict[str, List[str]], defaults: Dict[str, 
     st.file_uploader("上傳數位簽名檔", type=["png", "jpg", "jpeg", "webp", "bmp"], accept_multiple_files=False, key=EXPENSE_WIDGET_KEYS["signature"])
     existing_atts = list(form_data.get("attachment_files", []) or [])
     if existing_atts:
-        st.caption("已附附件")
+        st.caption('已附附件')
         for idx, att in enumerate(existing_atts):
-            ac1, ac2 = st.columns([6, 1])
+            ac1, ac2, ac3, ac4 = st.columns([4, 1, 1, 1])
             ac1.write(f"{idx + 1}. {att.get('name', '')}")
-            if ac2.button("移除", key=f"remove_att_{idx}", use_container_width=True):
+            drive_url = str(att.get('drive_url', '')).strip() if isinstance(att, dict) else ''
+            if drive_url:
+                ac2.link_button('預覽', drive_url, use_container_width=True)
+            else:
+                ac2.write('')
+            file_bytes, file_name, mime_type = _download_attachment_bytes(actor, att)
+            if file_bytes:
+                ac3.download_button('下載', data=file_bytes, file_name=file_name, mime=mime_type, key=f'actual_att_dl_{idx}', use_container_width=True)
+            else:
+                ac3.caption('無法下載')
+            if ac4.button('移除', key=f'remove_att_{idx}', use_container_width=True):
                 remove_attachment_from_form(actor, idx)
                 st.rerun()
     else:
-        st.caption("目前沒有已附附件。")
-    sig_meta = form_data.get("signature_file", {}) or {}
+        st.caption('目前沒有已附附件。')
+    sig_meta = form_data.get('signature_file', {}) or {}
     if sig_meta:
-        sc1, sc2 = st.columns([6, 1])
+        sc1, sc2, sc3, sc4 = st.columns([4, 1, 1, 1])
         sc1.write(f"數位簽名檔：{sig_meta.get('name', '')}")
-        if sc2.button("移除", key="remove_signature", use_container_width=True):
+        drive_url = str(sig_meta.get('drive_url', '')).strip() if isinstance(sig_meta, dict) else ''
+        if drive_url:
+            sc2.link_button('預覽', drive_url, use_container_width=True)
+        sig_bytes, sig_name, sig_mime = _download_attachment_bytes(actor, sig_meta)
+        if sig_bytes:
+            sc3.download_button('下載', data=sig_bytes, file_name=sig_name, mime=sig_mime, key='sig_download_actual', use_container_width=True)
+        else:
+            sc3.caption('無法下載')
+        if sc4.button('移除', key='remove_signature', use_container_width=True):
             remove_signature_from_form(actor)
             st.rerun()
     card_close()
@@ -1108,7 +1108,7 @@ def render_form_page(grouped_options: Dict[str, List[str]], defaults: Dict[str, 
         st.success(f"已{delete_label.replace('此筆', '')}。")
         st.rerun()
     if extra2.button("清空新增", use_container_width=True):
-        set_form_data(actor, _default_form_data(actor, grouped_options))
+        clear_form(actor, defaults, grouped_options)
         st.rerun()
 
 
@@ -1116,7 +1116,7 @@ def render_record_cards(df: pd.DataFrame, title: str, source: str, grouped_optio
     st.subheader(title)
     if source == "backup":
         st.warning("目前為本機備份快照模式，資料可能不是最新。")
-    elif source == "local" and status_default in {"draft", "all"}:
+    elif source == "local":
         st.info("目前顯示本機草稿。")
     if df.empty:
         st.info("目前沒有資料。")
@@ -1151,7 +1151,7 @@ def render_record_cards(df: pd.DataFrame, title: str, source: str, grouped_optio
             confirm_key = f"expense_hard_delete_confirm::{record_id}"
             if st.session_state.get(confirm_key):
                 cfm1, cfm2 = st.columns(2)
-                if cfm1.button("確認移除", key=f"expense_hard_delete_yes_{record_id}", type="primary", use_container_width=True):
+                if cfm1.button("確認永久移除", key=f"expense_hard_delete_yes_{record_id}", type="primary", use_container_width=True):
                     try:
                         archive_deleted_record(rec, system_type="expense", actor_email=actor.email)
                         owner_email = str(rec.get("user_email") or actor.email or "").strip().lower()
@@ -1163,7 +1163,7 @@ def render_record_cards(df: pd.DataFrame, title: str, source: str, grouped_optio
                         st.rerun()
                     except Exception as e:
                         st.error(f"永久移除失敗：{e}")
-                if cfm2.button("取消移除", key=f"expense_hard_delete_no_{record_id}", use_container_width=True):
+                if cfm2.button("取消", key=f"expense_hard_delete_no_{record_id}", use_container_width=True):
                     st.session_state.pop(confirm_key, None)
                     st.rerun()
             elif b4.button("移除", key=f"expense_hard_delete_{record_id}", disabled=not hard_deletable, use_container_width=True):
@@ -1281,27 +1281,27 @@ def _render_filters_and_metrics(df: pd.DataFrame, status_default: str, key_prefi
         r3[1].number_input("頁碼", min_value=1, value=1, disabled=True, key=f"{key_prefix}_page_no")
         return df
 
-    base_token = _expense_filter_cache_token(df, status_default)
-    prepared = _prepare_expense_filterable_df(base_token, df, status_default)
-    filter_token = "||".join([
-        base_token,
-        str(status_value),
-        owner_value.strip(),
-        plan_value.strip(),
-        record_value.strip(),
-        start_value.strip(),
-        end_value.strip(),
-    ])
-    filtered = _filter_expense_df_cached(
-        filter_token,
-        prepared,
-        status_value,
-        owner_value,
-        plan_value,
-        record_value,
-        start_value,
-        end_value,
-    )
+    filtered = df.copy().fillna("")
+    if "status" not in filtered.columns:
+        filtered["status"] = status_default if status_default in {"draft", "submitted", "deleted", "void"} else "draft"
+    filtered["owner_name"] = filtered.apply(lambda r: _owner_text(r.to_dict()), axis=1)
+    filtered["record_id_text"] = filtered.apply(lambda r: str(r.get("record_id") or r.get("id") or ""), axis=1)
+    filtered["month_text"] = filtered.apply(lambda r: _month_text(r.get("form_date", "")), axis=1)
+    filtered["plan_text"] = filtered.get("plan_code", "").astype(str)
+    filtered["status"] = filtered["status"].astype(str).str.lower()
+
+    if status_value != "all":
+        filtered = filtered[filtered["status"] == status_value]
+    if owner_value.strip():
+        filtered = filtered[filtered["owner_name"].str.contains(owner_value.strip(), case=False, na=False)]
+    if plan_value.strip():
+        filtered = filtered[filtered["plan_text"].str.contains(plan_value.strip(), case=False, na=False)]
+    if record_value.strip():
+        filtered = filtered[filtered["record_id_text"].str.contains(record_value.strip(), case=False, na=False)]
+    if start_value.strip():
+        filtered = filtered[filtered["month_text"] >= start_value.strip()]
+    if end_value.strip():
+        filtered = filtered[filtered["month_text"] <= end_value.strip()]
 
     total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
     current_page_no = int(st.session_state.get(f"{key_prefix}_page_no", 1) or 1)
@@ -1310,8 +1310,11 @@ def _render_filters_and_metrics(df: pd.DataFrame, status_default: str, key_prefi
     page_no = r3[1].number_input("頁碼", min_value=1, max_value=total_pages, value=current_page_no, step=1, key=f"{key_prefix}_page_no")
     page_df = filtered.iloc[(page_no - 1) * page_size : page_no * page_size].copy()
 
-    page_token = filter_token + f"||page={page_no}||size={page_size}"
-    untaxed_sum, tax_sum, total_sum, count, avg = _expense_page_metrics_cached(page_token, page_df)
+    untaxed_sum = int(page_df["amount_untaxed"].apply(safe_int).sum()) if "amount_untaxed" in page_df.columns else 0
+    tax_sum = int(page_df["tax_amount"].apply(safe_int).sum()) if "tax_amount" in page_df.columns else 0
+    total_sum = int(page_df["amount_total"].apply(safe_int).sum()) if "amount_total" in page_df.columns else 0
+    count = len(page_df)
+    avg = int(round(total_sum / count)) if count else 0
 
     m1, m2, m3, m4 = st.columns(4)
     metrics = [
@@ -1331,7 +1334,7 @@ def render_record_list_page(df: pd.DataFrame, title: str, source: str, grouped_o
     st.markdown(f'<div class="exp-list-title">{title}</div>', unsafe_allow_html=True)
     if source == "backup":
         st.warning("目前為本機備份快照模式，資料可能不是最新。")
-    elif source == "local" and status_default in {"draft", "all"}:
+    elif source == "local":
         st.info("目前顯示本機草稿。")
     filtered_df = _render_filters_and_metrics(df, status_default=status_default, key_prefix=key_prefix)
     if filtered_df.empty:
@@ -1361,10 +1364,9 @@ def render_record_list_page(df: pd.DataFrame, title: str, source: str, grouped_o
         row_cols[7].markdown(f'<div class="exp-table-cell">{safe_int(rec.get("amount_total")):,}</div>', unsafe_allow_html=True)
         row_cols[8].markdown(f'<div class="exp-table-cell">{str(rec.get("purpose_desc", ""))}</div>', unsafe_allow_html=True)
         row_cols[9].markdown(f'<div class="exp-table-cell">{updated_text}</div>', unsafe_allow_html=True)
-        action_cols = row_cols[10].columns(6)
+        action_cols = row_cols[10].columns(5)
         pdf_payload = _record_to_pdf_payload(rec, actor)
         pdf_bytes = _prepare_pdf_bytes(pdf_payload)
-        owner_email = str(rec.get("user_email") or actor.email or "").strip().lower()
         if action_cols[0].button("編輯", key=f"{key_prefix}_edit_{record_id}", use_container_width=True):
             load_record_into_form(rec, actor, grouped_options)
             st.session_state["expense_page"] = "new"
@@ -1389,46 +1391,16 @@ def render_record_list_page(df: pd.DataFrame, title: str, source: str, grouped_o
                 if action_label == "作廢":
                     api.record_soft_delete(actor=actor, record_id=record_id)
                     rec["status"] = "void"
-                    upsert_local_expense_draft(owner_email, rec)
+                    upsert_local_expense_draft(actor.email, rec)
                     st.success(f"{record_id} 已作廢。")
                 else:
-                    remove_local_expense_draft(owner_email, record_id, mark_deleted=True)
+                    remove_local_expense_draft(actor.email, record_id, mark_deleted=True)
                     rec["status"] = "deleted"
-                    upsert_local_expense_draft(owner_email, rec)
+                    upsert_local_expense_draft(actor.email, rec)
                     st.success(f"{record_id} 已刪除。")
-                refresh_runtime_cache(actor)
                 st.rerun()
             except Exception as e:
                 st.error(f"{action_label}失敗：{e}")
-
-        confirm_key = f"expense_hard_delete_confirm::{key_prefix}::{record_id}"
-        if st.session_state.get(confirm_key):
-            action_cols[5].markdown("<span style='color:#b91c1c;font-weight:600;'>待確認</span>", unsafe_allow_html=True)
-        elif action_cols[5].button("移除", key=f"{key_prefix}_hard_delete_{record_id}", disabled=not can_hard_delete(actor), use_container_width=True):
-            st.session_state[confirm_key] = True
-            st.rerun()
-
-        if st.session_state.get(confirm_key):
-            st.warning(f"{record_id} 將永久移除；執行前會先備份到 deleted archive。")
-            hd1, hd2 = st.columns(2)
-            if hd1.button("確認移除", key=f"{key_prefix}_hard_delete_yes_{record_id}", type="primary", use_container_width=True):
-                try:
-                    archive_deleted_record(rec, system_type="expense", actor_email=actor.email)
-                    remove_local_expense_draft(owner_email, record_id, mark_deleted=False)
-                    ok, msg = _queue_and_try_sync_expense(actor, 'expense_hard_delete', {'record_id': record_id, 'user_email': owner_email, 'system_type': 'expense'})
-                    st.session_state.pop(confirm_key, None)
-                    refresh_runtime_cache(actor)
-                    if ok:
-                        st.success(f"{record_id} 已永久移除。")
-                    else:
-                        st.warning(f"{record_id} 已備份並標記待同步移除：{msg}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"永久移除失敗：{e}")
-            if hd2.button("取消移除", key=f"{key_prefix}_hard_delete_no_{record_id}", use_container_width=True):
-                st.session_state.pop(confirm_key, None)
-                st.info("已取消移除。")
-                st.rerun()
 
 
 def render_drafts_page(grouped_options: Dict[str, List[str]], defaults: Dict[str, Any]) -> None:
@@ -1488,6 +1460,8 @@ with st.sidebar:
     )
     if page_choice != current_page:
         st.session_state["expense_page"] = page_choice
+        if page_choice == "new":
+            clear_form(actor, defaults, grouped_options)
         st.rerun()
     if st.button("➕ 清空並新增一筆", use_container_width=True):
         clear_form(actor, defaults, grouped_options)
