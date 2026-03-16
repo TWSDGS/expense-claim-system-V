@@ -1,0 +1,20 @@
+[
+  {
+    "event_type": "sync_applied",
+    "operation": "save_draft",
+    "record_id": "9601020260315001",
+    "system_type": "expense",
+    "queue_owner_email": "joli@sahtech.org",
+    "event_id": "",
+    "logged_at": "2026-03-16T15:38:31"
+  },
+  {
+    "event_type": "sync_applied",
+    "operation": "save_draft",
+    "record_id": "9601020260315002",
+    "system_type": "expense",
+    "queue_owner_email": "joli@sahtech.org",
+    "event_id": "",
+    "logged_at": "2026-03-16T15:39:40"
+  }
+]

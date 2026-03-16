@@ -1,0 +1,20 @@
+Verified before packaging:
+1. py_compile passed for app.py, cache_utils.py, expense.py, apps/travel_old.py, pdf_gen.py, pdf_gen_travel.py
+2. app.py target page apps/travel_old.py exists
+3. cache_utils.py now includes:
+   - remove_local_expense_draft
+   - load_local_travel_records
+   - upsert_local_travel_record
+   - mark_local_travel_status
+   - save_uploaded_attachment
+   - delete_saved_file
+4. expense.py imports resolved against cache_utils.py
+5. apps/travel_old.py imports resolved against cache_utils.py and pdf_gen_travel.py
+
+Implemented in this build:
+- Travel page has attachment upload, digital signature upload, copy form, delete attached files, local draft/submit/void/delete actions
+- Expense and travel list status behavior:
+  * submitted list => submitted, void
+  * drafts list => draft, deleted
+- Expense form and travel form include delete/void action in form page and in list row actions
+- Attachment removal updates current form data and affects generated PDF output
